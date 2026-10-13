@@ -14,6 +14,18 @@ from pydantic import BaseModel
 
 from .config import get
 
+# The retrieval instruction every query is prefixed with (both the cuVS and
+# the pg pipeline embed `f"Instruction: {INSTRUCTION}. Query: {query}"`, and
+# the rerank prompt carries it as its <Instruct> line). Lives here — the
+# CPU-only contract module — so both pipelines share one source of truth.
+INSTRUCTION = (
+    "Retrieve the informal + formal representation of items in Mathlib4 "
+    "that is mathematically relevant to the query. If the query ask for "
+    "theorem or lemma, you shall try to find the entry that starts with "
+    "theorem. If the query ask for a definition, you shall try to find "
+    "the entry that starts with either definition or instance."
+)
+
 
 class ResultData(BaseModel):
     module_name: list[str]

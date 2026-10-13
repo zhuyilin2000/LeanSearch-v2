@@ -13,6 +13,9 @@ paths:
   # Download a pre-built copy from HuggingFace or build your own.
   cuvs_db: data/cuvs/mathlib-v4.28.0-rc1
 
+  # Corpus JSONL for the pg backend (HF: FrenzyMath/lsv2-mathlib-v4.28.0-rc1-jsonl).
+  corpus_jsonl: data/jsonl/lsv2-mathlib-v4.28.0-rc1.jsonl
+
   # Working directory for the corpus build pipeline (jixia raw + merged JSONL).
   corpus_workdir: data/corpus
 
@@ -28,8 +31,43 @@ models:
   reranker: Qwen/Qwen3-Reranker-8B
 
 serve:
+  index_backend: cuvs        # cuvs | pg (pg = SiliconFlow API + PostgreSQL/pgvector, CPU-only)
   num_gpus: null              # null = use every visible GPU
   gpu_memory_utilization: 0.9
+
+# PostgreSQL/pgvector backend (serve.index_backend: pg). The database lives
+# in an existing pgvector-enabled PostgreSQL 17 instance.
+pg:
+  host: localhost             # env: PG_HOST
+  port: 5432                  # env: PG_PORT
+  dbname: leansearch          # env: PG_DBNAME
+  user: deepanalyze           # env: PG_USER
+  # password: inline value, or (preferred) the env var named by password_env
+  password_env: LEANSEARCH_PG_PASSWORD
+  pool_min: 1
+  pool_max: 8
+  ef_search: 512              # hnsw.ef_search per pooled connection (only matters once a HNSW index exists)
+  exact_scan: false           # true = force exact seq-scan ordering (SET LOCAL enable_indexscan=off)
+
+# SiliconFlow API (pg backend): embeddings + rerank. Same key-indirection
+# pattern as llm.<profile>: inline `siliconflow.api_key` (config.local.yaml)
+# or the env var named by `api_key_env`.
+siliconflow:
+  base_url: https://api.siliconflow.cn/v1
+  api_key_env: SILICONFLOW_API_KEY
+  embedding:
+    model: Qwen/Qwen3-Embedding-8B
+    dimensions: 1024          # MRL truncation (native 4096); fits pgvector's 2000-dim HNSW limit
+    batch_size: 128           # smoke-tested up to 512; smaller = smaller retry granularity
+    concurrency: 4            # loader parallelism (smoke test: no 429s at concurrency 4)
+    timeout_s: 120
+    max_retries: 6
+  rerank:
+    model: Qwen/Qwen3-Reranker-8B
+    timeout_s: 120
+    max_retries: 1            # query path: fall back to retriever order quickly
+    max_documents_per_request: null   # smoke-tested at 200, no cap hit
+    use_instruction: true     # API supports a custom instruction; v2's INSTRUCTION is passed
 
 # Retriever endpoint consumed by reasoning mode and the prove task.
 # Default points at a locally-running `scripts/serve.sh`.

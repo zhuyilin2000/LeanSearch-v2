@@ -48,3 +48,32 @@
 #   max_docstring_tokens: 800
 #   max_dependency_items: 96     # cap on dependencies injected per prompt
 #   max_dependency_item_tokens: 400
+
+# CPU-only pg backend (SiliconFlow API + PostgreSQL/pgvector) — see
+# docs/deploy-pg.md. Uncomment and set `serve.index_backend: pg` to replace
+# the cuVS/GPU stack entirely. Secrets go in .env (SILICONFLOW_API_KEY,
+# LEANSEARCH_PG_PASSWORD), not here.
+# serve:
+#   index_backend: pg
+# pg:
+#   host: localhost
+#   port: 5432
+#   dbname: leansearch
+#   user: deepanalyze
+#   password_env: LEANSEARCH_PG_PASSWORD
+#   pool_min: 1
+#   pool_max: 8
+#   ef_search: 512               # hnsw.ef_search per connection (HNSW only)
+#   exact_scan: false            # true = force exact seq-scan ordering
+# siliconflow:
+#   base_url: https://api.siliconflow.cn/v1
+#   api_key_env: SILICONFLOW_API_KEY
+#   embedding:
+#     model: Qwen/Qwen3-Embedding-8B
+#     dimensions: 1024           # MRL truncation of the native 4096
+#     batch_size: 128
+#     timeout_s: 120
+#   rerank:
+#     model: Qwen/Qwen3-Reranker-8B
+#     timeout_s: 120
+#     use_instruction: true

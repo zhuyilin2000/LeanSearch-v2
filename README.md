@@ -130,6 +130,23 @@ This starts `leansearchv2.server:app` on `0.0.0.0:8000` (override with
 `query: list[str]`, `num_results: int = 10`, `rerank: bool = True`,
 `retrieve_k: int | None = None`.
 
+### CPU-only deployment (SiliconFlow API + PostgreSQL/pgvector)
+
+On machines without NVIDIA GPUs there is a wire-compatible backend that
+swaps the whole GPU stack for the SiliconFlow
+`Qwen3-Embedding-8B`/`Qwen3-Reranker-8B` APIs plus a pgvector database
+(1024-dim MRL truncation; exact-scan retrieval by default, optional HNSW):
+
+```bash
+pip install -r requirements-pg.txt      # NOT requirements.txt (needs aarch64-hostile CUDA wheels)
+./scripts/serve_pg.sh                   # same endpoints, same wire format
+```
+
+See **[docs/deploy-pg.md](docs/deploy-pg.md)** for the full runbook (corpus
+download, `load_pg init/load/embed/verify`, cost estimates, evaluation).
+Do not install upstream `requirements.txt` on the pg backend — it pins the
+cuVS/CUDA stack and requires Python ≥ 3.11.
+
 ### Reproduce Table 1 (Search task on MathlibQR)
 
 Start `./scripts/serve.sh` on a GPU pod (the canonical 8B reranker

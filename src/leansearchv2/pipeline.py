@@ -18,7 +18,7 @@ from cuvs.neighbors import cagra
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .standard_client import ResultData, SearchResult
+from .standard_client import INSTRUCTION, ResultData, SearchResult
 
 
 _PREFIX = (
@@ -31,13 +31,8 @@ _SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 
 class RetrievalPipeline:
-    INSTRUCTION = (
-        "Retrieve the informal + formal representation of items in Mathlib4 "
-        "that is mathematically relevant to the query. If the query ask for "
-        "theorem or lemma, you shall try to find the entry that starts with "
-        "theorem. If the query ask for a definition, you shall try to find "
-        "the entry that starts with either definition or instance."
-    )
+    INSTRUCTION = INSTRUCTION
+    index_backend = "cuvs"
 
     def __init__(
         self,
