@@ -1,5 +1,11 @@
 # LeanSearch v2
 
+> **This is a modified fork.** It is based on
+> [frenzymath/LeanSearch-v2](https://github.com/frenzymath/LeanSearch-v2)
+> (Apache License 2.0) and is published here under the same license. See
+> [Changes from upstream](#changes-from-upstream) at the end of this file for a
+> summary of what was modified.
+
 A retrieval system for Lean 4 theorem proving. The corpus is extracted from
 Mathlib with [jixia](https://github.com/frenzymath/jixia) and encoded with
 [Qwen3-Embedding-8B](https://huggingface.co/Qwen/Qwen3-Embedding-8B); two modes
@@ -233,3 +239,58 @@ If you use FATE-H please also cite
 Apache 2.0. See `LICENSE`. `benchmark/FATE-H.jsonl` is redistributed under
 CC BY 4.0; see `benchmark/FATE-H.LICENSE`. `external/jixia` is licensed
 separately (Apache 2.0).
+
+## Changes from upstream
+
+Modifications relative to
+[frenzymath/LeanSearch-v2](https://github.com/frenzymath/LeanSearch-v2) `main`
+(`94f4888`), as required by Apache License 2.0 §4(b). Every file listed as
+*modified* below was changed by this fork.
+
+**Added — a CPU-only backend** (the upstream code requires an NVIDIA GPU: the
+`cuVS`/`cupy`/`torch` stack has no wheels for aarch64/NPU hosts). It runs the
+same corpus and the same HTTP contract on the SiliconFlow
+`Qwen3-Embedding-8B` / `Qwen3-Reranker-8B` APIs plus PostgreSQL/pgvector:
+
+| Path | Purpose |
+|---|---|
+| `src/leansearchv2/siliconflow.py` | SiliconFlow embeddings/rerank client |
+| `src/leansearchv2/pgdb.py` | PostgreSQL connection pool |
+| `src/leansearchv2/pg_pipeline.py` | `PGRetrievalPipeline` (same interface as the cuVS pipeline) |
+| `src/leansearchv2/corpus/load_pg.py` | corpus loader CLI: `init/load/embed/index/verify/status` |
+| `scripts/serve_pg.sh`, `requirements-pg.txt` | launcher and CUDA-free dependency set |
+| `docs/deploy-pg.md` | deployment runbook |
+| `scripts/check_hnsw_recall.py`, `scripts/check_verifier.py` | verification tools |
+
+`/search`, `/search_with_profile` and `/health` are unchanged in shape, so
+existing clients work against either backend; select one with
+`serve.index_backend` (`cuvs` or `pg`).
+
+**Modified — bug fixes and hardening** (each reproduced before and after):
+
+- `prove/verifier.py` — a `LeanError` from the REPL was read as a clean compile
+  (`getattr(response, "messages", [])` is empty for `LeanError`), so a REPL-level
+  failure could be reported as a *successful proof*. Now fails closed.
+- `eval/premise_metrics.py` — `all(hit_orig) if orig_groups else True` made
+  Covered@k vacuously 1 for rows without original groups (`all([]) == True`).
+- `reasoning/decompose.py` — the fenced branch of `_parse_json` skipped the
+  `isinstance(obj, dict)` check; query fields are now shape-checked, so a
+  returned string no longer explodes into one query per character.
+- `reasoning/filter.py` — kept indices were neither de-duplicated nor restored
+  to retrieval order.
+- `reasoning/run.py` — a failed search silently became "no results".
+- `pipeline.py` — `reranker_devices = range(1, num_gpus)` is empty on a
+  single-GPU host, and the following `// n` divided by zero *outside* the
+  `try`, bypassing the documented fallback.
+- `siliconflow.py` — `resp.json()` was called outside the `SiliconFlowError`
+  guards on a <400 response, turning a graceful rerank fallback into a 500.
+- `config.py` — `bool(get(...))` turned the strings `"0"`/`"false"`/`"no"` into
+  `True`; added `parse_bool`/`get_bool`/`get_int`, which raise on unknown tokens.
+- `server.py` — `pipeline.close()` was never called; requests are now bounded.
+- `standard_client.py` — `INSTRUCTION` moved here so both pipelines share one
+  definition.
+
+**Unchanged** — `external/jixia`, `benchmark/*`, the upstream corpus toolchain
+(`corpus/build_cuvs.py`, `informalize.py`, `jixia_extract.py`,
+`merge_to_jsonl.py`, `templates/*.j2`), the upstream scripts, and the main
+logic of `eval/`, `reasoning/`, `prove/`.
