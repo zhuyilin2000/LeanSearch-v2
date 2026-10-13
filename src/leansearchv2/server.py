@@ -64,6 +64,9 @@ async def lifespan(app: FastAPI):
     finally:
         # Release the connection pool and the two httpx clients on shutdown;
         # `close()` had no caller at all, so they leaked until process exit.
+        # Logged unconditionally: the failure path below only warns, which made
+        # it impossible to tell a clean shutdown from a lifespan that never ran.
+        log.info("Shutting down...")
         close = getattr(app.pipeline, "close", None)
         if close is not None:
             try:
@@ -71,6 +74,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:  # shutdown must not raise
                 log.warning("pipeline close failed: %s", e)
         app.pipeline = None
+        log.info("Shutdown complete")
 
 
 app = FastAPI(lifespan=lifespan)
