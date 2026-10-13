@@ -154,6 +154,38 @@ paper's Table 1: retriever-only slightly below (1024-dim MRL truncation vs the
 native 4096-dim build), rerank row closer (same 8B reranker model, custom
 instruction honored). See `reports/search/summary.json` for the raw numbers.
 
+### Findings from this deployment (2026-10-13)
+
+Full 946-query eval over the complete 310,579-entry corpus (~1.2 h wall clock,
+~1.3 s/query retriever-only, ~4.3 s/query rerank — SiliconFlow API latency
+dominates):
+
+| slice | config | n | nDCG@1 | nDCG@5 | nDCG@10 | R@1 | R@5 | R@10 | R@50 | R@100 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fair | retriever-only | 810 | 0.341 | 0.480 | 0.505 | 0.341 | 0.601 | 0.678 | 0.795 | 0.827 |
+| fair | **rerank** | 810 | **0.465** | **0.594** | **0.617** | **0.465** | **0.705** | **0.777** | 0.841 | 0.856 |
+| full | retriever-only | 946 | 0.320 | 0.455 | 0.478 | 0.320 | 0.572 | 0.644 | 0.757 | 0.784 |
+| full | **rerank** | 946 | **0.438** | **0.564** | **0.585** | **0.438** | **0.673** | **0.737** | 0.797 | 0.810 |
+
+Interpretation against the paper's Table 1 (exact figures in
+[arXiv:2605.13137](https://arxiv.org/abs/2605.13137); the deployment-acceptance
+targets set for this run were fair-subset rerank R@10 ≥ 0.75 and
+retriever-only in the 0.55–0.65 band):
+
+- **rerank R@10 = 0.777 (fair) / 0.737 (full)** — meets the ≥0.75 acceptance
+  target on the fair subset; the 8B reranker with the custom `instruction`
+  behaves as the paper's.
+- **retriever-only R@10 = 0.678 (fair)** — slightly *above* the 0.55–0.65
+  band we budgeted for 1024-dim MRL truncation; the exact-scan retrieval
+  (recall 1.0, vs the paper's approximate cuVS CAGRA) likely offsets the
+  truncation loss.
+- rerank lifts R@1 by ~36% relative (0.341 → 0.465 fair), consistent with
+  the paper's reranker delta.
+
+One-time corpus cost: 71.3M prompt tokens (batch-128, concurrency 4, ~65 min);
+at SiliconFlow's Qwen3-Embedding-8B tier this ran to roughly ¥35–140
+depending on price/M — check the console billing for the exact figure.
+
 ## 6. Ops notes
 
 - Config is read once per process (`config._CACHE`): **restart** the server
