@@ -104,23 +104,44 @@ Afterwards:
 
 ## 3. Retrieval strategy: exact scan (default) vs HNSW
 
-With 310k × 1024-dim vectors (~600 MB, page-cached), `ORDER BY embedding <=> $q`
-**without an index** is an exact scan: ~150–500 ms per query, recall 1.0
-(no worse than the paper's approximate cuVS CAGRA). Request latency is
-dominated by the two SiliconFlow API calls anyway, so the first deployment
-skips the ANN index entirely — zero tuning, zero recall loss.
+With 310k × 1024-dim vectors (`vector(1024)` is 4 KB per row, which exceeds the
+TOAST threshold, so the vectors live out-of-line), `ORDER BY embedding <=> $q`
+**without an index** is an exact scan with recall 1.0 — but it is a *parallel
+sequential scan* of the whole table on every query. Measured on the reference
+host (192 cores, `shared_buffers=128MB`):
 
-If you later want sub-10 ms retrieval, add the index (no code changes; the
-planner picks it up automatically, and each pooled connection already sets
-`hnsw.ef_search` from `pg.ef_search`, default 512 — the stock default of 40
-would silently miss top-200 candidates):
+| | exact scan, no index |
+|---|---|
+| `ORDER BY … LIMIT 10 / 50 / 200` | ~1.8–1.9 s per query (k-independent) |
+| plan | `Gather Merge` ← 2 workers ← `Seq Scan` + top-N heapsort |
+| buffers | `shared hit=1128763 read=296186` (~2.3 GB touched per query) |
+
+So the "no index" path is only reasonable for a toy corpus or a
+cold-start deployment; on this host it dominates request latency (the whole
+`/search` with `rerank=true` measured ~4.2 s, of which ~2.5 s was retrieval).
+
+Build the ANN index to fix that (no code changes; the planner picks it up
+automatically, and each pooled connection already sets `hnsw.ef_search` from
+`pg.ef_search`, default 512 — the stock default of 40 would silently miss
+top-200 candidates):
 
 ```bash
 .venv/bin/python -m leansearchv2.corpus.load_pg index   # optional HNSW (m=16, ef_construction=200)
+PYTHONPATH=src .venv/bin/python scripts/check_hnsw_recall.py   # recall vs exact + latency
 ```
 
-`pg.exact_scan: true` (or env `PG_EXACT_SCAN=1`) forces a seq scan again for
-A/B comparisons.
+The build is **serial by default** (`pg.parallel_maintenance_workers: 0`). With
+parallel maintenance workers Postgres allocates `maintenance_work_mem` from
+dynamic shared memory, i.e. `/dev/shm`, which a stock Docker container caps at
+64 MB — an 8 GB build then dies with
+`DiskFull: could not resize shared memory segment … No space left on device`
+even though the data directory has plenty of free space. Raise the setting only
+if the container was started with a large `--shm-size`.
+
+`pg.exact_scan: true` (or env `PG_EXACT_SCAN=1`) forces a seq scan again for A/B
+comparisons — useful once the HNSW index exists and you want to compare against
+the exact ordering. Boolean env vars accept `1/true/yes/on` and
+`0/false/no/off`; anything else raises instead of guessing.
 
 ## 4. Serve
 

@@ -81,3 +81,48 @@ def get_path(env_key: str, *yaml_path: str, default: str | None = None) -> str:
             f"Missing path: set ${env_key} or config.yaml:{'.'.join(yaml_path)}"
         )
     return _resolve(value)
+
+
+_TRUE_TOKENS = frozenset({"1", "true", "t", "yes", "y", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "f", "no", "n", "off"})
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    """Coerce a config value to ``bool``.
+
+    ``get()`` returns environment variables verbatim, so ``bool(get(...))`` turns
+    ``"0"``/``"false"``/``"no"`` into ``True`` — silently inverting the switch.
+    YAML already yields real booleans; this keeps both paths honest.
+
+    An unrecognised token raises instead of falling back to a default: guessing
+    is how a typo in a config becomes a silent behaviour change.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if not text:
+        return default
+    if text in _TRUE_TOKENS:
+        return True
+    if text in _FALSE_TOKENS:
+        return False
+    raise ValueError(
+        f"not a boolean: {value!r} (expected one of {sorted(_TRUE_TOKENS | _FALSE_TOKENS)})"
+    )
+
+
+def get_bool(env_key: str, *yaml_path: str, default: bool = False) -> bool:
+    """Like :func:`get`, but parsed with :func:`parse_bool`."""
+    return parse_bool(get(env_key, *yaml_path, default=default), default)
+
+
+def get_int(env_key: str, *yaml_path: str, default: int | None = None) -> int | None:
+    """Like :func:`get`, but coerced to ``int`` (``None`` passes through)."""
+    value = get(env_key, *yaml_path, default=default)
+    if value is None or value == "":
+        return default
+    return int(value)

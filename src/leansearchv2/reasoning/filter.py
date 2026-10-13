@@ -8,16 +8,53 @@ first few docs by retrieval order (degraded but non-empty).
 from __future__ import annotations
 
 import asyncio
-from typing import Iterable
+import logging
+from typing import Any, Iterable
 
 from ..llm import LLMClient
 from ..standard_client import SearchResult
 from . import prompts
 from .decompose import _parse_json
 
+log = logging.getLogger(__name__)
+
 
 _MAX_DOCS_TO_LLM = 20
 _FALLBACK_KEEP = 5
+
+
+def _kept_indices(value: Any, limit: int) -> list[int]:
+    """Normalise the model's `kept_results` into ascending, de-duplicated,
+    in-range document indices.
+
+    Ascending order restores *retrieval* order. Left as the model wrote them,
+    duplicates would emit the same document twice — double-counting its
+    contribution to the merged ranking (run.py's `1/log2(rank+2)` decay) and
+    pushing every later document one position further down.
+
+    Integral floats (`0.0`) are accepted; a non-empty field that yields nothing
+    is logged rather than silently discarded.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple)) else [value]
+    out: set[int] = set()
+    for item in items:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            idx = item
+        elif isinstance(item, float) and item.is_integer():
+            idx = int(item)
+        elif isinstance(item, str) and item.strip().lstrip("-").isdigit():
+            idx = int(item.strip())
+        else:
+            continue
+        if 0 <= idx < limit:
+            out.add(idx)
+    if items and not out:
+        log.warning("filter: dropped unusable kept_results %r (limit %d)", value, limit)
+    return sorted(out)
 
 
 def _pretty_inline(r: SearchResult) -> str:
@@ -60,8 +97,7 @@ async def _filter_single(
     try:
         response = await llm.chat([{"role": "user", "content": prompt}], temperature=0.0)
         data = _parse_json(response)
-        kept = list(data.get("kept_results") or [])
-        kept = [int(i) for i in kept if isinstance(i, (int, str)) and str(i).isdigit() and int(i) < len(truncated)]
+        kept = _kept_indices(data.get("kept_results"), len(truncated))
         return kept, str(data.get("reasoning") or "")
     except Exception as e:
         return list(range(min(_FALLBACK_KEEP, len(truncated)))), f"filter failed ({type(e).__name__}: {e}); keeping top {_FALLBACK_KEEP}"

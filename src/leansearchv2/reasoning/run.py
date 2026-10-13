@@ -22,6 +22,7 @@ across sub-queries) so docs hit by multiple sub-queries surface first.
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,6 +32,8 @@ from ..standard_client import SearchResult, StandardClient
 from .decompose import ProofPlan, decompose
 from .filter import filter_results, union_unique_results
 from .judge import judge
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -140,7 +143,13 @@ async def _batch_search(
         async with sem:
             try:
                 return q, await retriever.search(q, top_k=top_k, rerank=rerank)
-            except Exception:
+            except Exception as e:
+                # A silent `[]` made a service failure indistinguishable from
+                # "nothing relevant exists"; the run then scored 0 with no clue.
+                log.warning(
+                    "search failed for query %r (%s: %s); treating as no results",
+                    q[:120], type(e).__name__, e,
+                )
                 return q, []
 
     pairs = await asyncio.gather(*[one(q) for q in queries])

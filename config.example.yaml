@@ -65,6 +65,9 @@
 #   pool_max: 8
 #   ef_search: 512               # hnsw.ef_search per connection (HNSW only)
 #   exact_scan: false            # true = force exact seq-scan ordering
+#   maintenance_work_mem: 8GB    # `load_pg index` build memory (HNSW spills to disk below ~1.4GB)
+#   parallel_maintenance_workers: 0   # serial build: maintenance_work_mem then comes from
+#                                     # private memory instead of /dev/shm (64MB in Docker)
 # siliconflow:
 #   base_url: https://api.siliconflow.cn/v1
 #   api_key_env: SILICONFLOW_API_KEY
@@ -72,8 +75,17 @@
 #     model: Qwen/Qwen3-Embedding-8B
 #     dimensions: 1024           # MRL truncation of the native 4096
 #     batch_size: 128
+#     concurrency: 4             # loader parallelism (embed subcommand)
 #     timeout_s: 120
+#     max_retries: 6
+#     backoff_base_s: 1.0
+#     backoff_cap_s: 60.0
 #   rerank:
 #     model: Qwen/Qwen3-Reranker-8B
 #     timeout_s: 120
+#     # 429s are per-minute token limits, so retries need to outlast the window.
+#     max_retries: 4
+#     backoff_base_s: 8.0
+#     backoff_cap_s: 60.0
 #     use_instruction: true
+#     max_documents_per_request: null

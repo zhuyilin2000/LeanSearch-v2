@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 
-from .config import get
+from .config import get, get_bool, get_int
 
 
 class SiliconFlowError(RuntimeError):
@@ -96,7 +96,23 @@ class _RetryCapableClient:
                 if resp.status_code >= 400:
                     # Non-retryable client error: fail immediately with details.
                     raise SiliconFlowError(f"{path}: HTTP {resp.status_code}: {resp.text[:300]}")
-                return resp.json()
+                try:
+                    data = resp.json()
+                except ValueError as e:
+                    # A <400 status with a non-JSON body (gateway/WAF HTML page,
+                    # truncated response, empty 200) must surface as
+                    # SiliconFlowError so callers can apply their fallback.
+                    # Letting JSONDecodeError escape bypassed every
+                    # `except SiliconFlowError` handler in the serving path.
+                    raise SiliconFlowError(
+                        f"{path}: HTTP {resp.status_code} but the body was not JSON "
+                        f"({type(e).__name__}): {resp.text[:300]!r}"
+                    ) from e
+                if not isinstance(data, dict):
+                    raise SiliconFlowError(
+                        f"{path}: expected a JSON object, got {type(data).__name__}: {str(data)[:200]}"
+                    )
+                return data
             except (httpx.TimeoutException, httpx.TransportError) as e:
                 last_err = e
                 if attempt < self.max_retries:
@@ -123,6 +139,8 @@ class SiliconFlowEmbedder:
         dimensions: int = 1024,
         timeout_s: float = 120.0,
         max_retries: int = 6,
+        backoff_base_s: float = 1.0,
+        backoff_cap_s: float = 60.0,
     ) -> None:
         self.model = model
         self.dimensions = int(dimensions)
@@ -133,6 +151,8 @@ class SiliconFlowEmbedder:
             base_url=base_url,
             timeout_s=timeout_s,
             max_retries=max_retries,
+            backoff_base_s=backoff_base_s,
+            backoff_cap_s=backoff_cap_s,
         )
 
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -186,6 +206,8 @@ class SiliconFlowReranker:
         model: str = "Qwen/Qwen3-Reranker-8B",
         timeout_s: float = 120.0,
         max_retries: int = 1,
+        backoff_base_s: float = 1.0,
+        backoff_cap_s: float = 60.0,
         max_documents_per_request: int | None = None,
         use_instruction: bool = True,
         instruction: str | None = None,
@@ -195,7 +217,12 @@ class SiliconFlowReranker:
         self.use_instruction = use_instruction
         self.instruction = instruction
         self._http = _RetryCapableClient(
-            api_key, base_url=base_url, timeout_s=timeout_s, max_retries=max_retries
+            api_key,
+            base_url=base_url,
+            timeout_s=timeout_s,
+            max_retries=max_retries,
+            backoff_base_s=backoff_base_s,
+            backoff_cap_s=backoff_cap_s,
         )
 
     def rerank(
@@ -215,10 +242,17 @@ class SiliconFlowReranker:
         """
         if not documents:
             return []
-        effective_instruction = (
-            instruction if instruction is not None
-            else (self.instruction if self.use_instruction else None)
-        )
+        # Config beats the caller's argument here. `pg_pipeline` passes the
+        # standard INSTRUCTION as a *default*, so letting the explicit argument
+        # win made both `use_instruction` and `instruction` dead knobs on the
+        # serving path: setting `use_instruction: false` still sent the
+        # instruction, and a custom `instruction` was silently ignored.
+        if not self.use_instruction:
+            effective_instruction: str | None = None
+        elif self.instruction is not None:
+            effective_instruction = self.instruction
+        else:
+            effective_instruction = instruction
         chunk = self.max_documents_per_request or len(documents)
         merged: list[tuple[int, float]] = []
         for start in range(0, len(documents), chunk):
@@ -261,6 +295,8 @@ def embedder_from_config() -> SiliconFlowEmbedder:
         dimensions=int(get("SILICONFLOW_EMBEDDING_DIMENSIONS", "siliconflow", "embedding", "dimensions", default=1024)),
         timeout_s=float(get("SILICONFLOW_EMBEDDING_TIMEOUT_S", "siliconflow", "embedding", "timeout_s", default=120)),
         max_retries=int(get("SILICONFLOW_EMBEDDING_MAX_RETRIES", "siliconflow", "embedding", "max_retries", default=6)),
+        backoff_base_s=float(get("SILICONFLOW_EMBEDDING_BACKOFF_BASE_S", "siliconflow", "embedding", "backoff_base_s", default=1.0)),
+        backoff_cap_s=float(get("SILICONFLOW_EMBEDDING_BACKOFF_CAP_S", "siliconflow", "embedding", "backoff_cap_s", default=60.0)),
     )
 
 
@@ -271,9 +307,20 @@ def reranker_from_config() -> SiliconFlowReranker:
         model=str(get("SILICONFLOW_RERANK_MODEL", "siliconflow", "rerank", "model", default="Qwen/Qwen3-Reranker-8B")),
         timeout_s=float(get("SILICONFLOW_RERANK_TIMEOUT_S", "siliconflow", "rerank", "timeout_s", default=120)),
         max_retries=int(get("SILICONFLOW_RERANK_MAX_RETRIES", "siliconflow", "rerank", "max_retries", default=1)),
-        max_documents_per_request=get(
-            "SILICONFLOW_RERANK_MAX_DOCS", "siliconflow", "rerank", "max_documents_per_request", default=None
+        backoff_base_s=float(get("SILICONFLOW_RERANK_BACKOFF_BASE_S", "siliconflow", "rerank", "backoff_base_s", default=1.0)),
+        backoff_cap_s=float(get("SILICONFLOW_RERANK_BACKOFF_CAP_S", "siliconflow", "rerank", "backoff_cap_s", default=60.0)),
+        max_documents_per_request=get_int(
+            # Canonical name follows the section/subsection/key convention. The
+            # short legacy name is still honoured because it was the only one
+            # that ever took effect (it crashed, which is now fixed).
+            "SILICONFLOW_RERANK_MAX_DOCUMENTS_PER_REQUEST",
+            "siliconflow", "rerank", "max_documents_per_request", default=None,
+        ) or get_int(
+            "SILICONFLOW_RERANK_MAX_DOCS",
+            "siliconflow", "rerank", "max_documents_per_request", default=None,
         ),
-        use_instruction=bool(get("SILICONFLOW_RERANK_USE_INSTRUCTION", "siliconflow", "rerank", "use_instruction", default=True)),
+        use_instruction=get_bool(
+            "SILICONFLOW_RERANK_USE_INSTRUCTION", "siliconflow", "rerank", "use_instruction", default=True
+        ),
         instruction=get("SILICONFLOW_RERANK_INSTRUCTION", "siliconflow", "rerank", "instruction", default=None),
     )

@@ -21,6 +21,10 @@ if ! grep -q '^SILICONFLOW_API_KEY=..' .env; then
     echo "error: SILICONFLOW_API_KEY missing/empty in .env" >&2
     exit 1
 fi
+if ! grep -q '^LEANSEARCH_PG_PASSWORD=..' .env; then
+    echo "error: LEANSEARCH_PG_PASSWORD missing/empty in .env" >&2
+    exit 1
+fi
 
 # PYTHONPATH is overwritten (not appended): the host's Ascend toolkit exports
 # its own site-packages globally, which can shadow this repo's dependencies.

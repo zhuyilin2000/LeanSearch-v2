@@ -54,8 +54,13 @@ def score_one(
         hit_alt = [hit(g) for g in alt_groups]
         n_hit = sum(hit_orig) + sum(hit_alt)
         out_recall[k] = n_hit / max(N, 1)
-        main_done = all(hit_orig) if orig_groups else True
-        alt_all = len(alt_groups) > 0 and all(hit_alt)
+        # Guard *both* sides: `all([])` is True, so `all(hit_orig)` on a row with
+        # no original groups made "covered" vacuously 1 — a row with no groups at
+        # all scored 1.0 while its recall was 0. The docstring requires the
+        # original routing's groups to be all hit, or the alternatives to exist
+        # and all be hit, so an empty side can never satisfy its own disjunct.
+        main_done = bool(orig_groups) and all(hit_orig)
+        alt_all = bool(alt_groups) and all(hit_alt)
         out_covered[k] = int(main_done or alt_all)
     return {"recall_group": out_recall, "covered": out_covered}
 

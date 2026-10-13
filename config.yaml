@@ -48,6 +48,13 @@ pg:
   pool_max: 8
   ef_search: 512              # hnsw.ef_search per pooled connection (only matters once a HNSW index exists)
   exact_scan: false           # true = force exact seq-scan ordering (SET LOCAL enable_indexscan=off)
+  maintenance_work_mem: 8GB   # `load_pg index` build memory; HNSW spills to disk below ~1.4GB here (~3x slower)
+  # `load_pg index` keeps the build serial by default: with parallel maintenance
+  # workers Postgres takes maintenance_work_mem from dynamic shared memory
+  # (/dev/shm), which a default Docker container caps at 64MB — an 8GB build then
+  # fails with `DiskFull: could not resize shared memory segment`. Raise this
+  # only if the container was started with a large --shm-size.
+  parallel_maintenance_workers: 0
 
 # SiliconFlow API (pg backend): embeddings + rerank. Same key-indirection
 # pattern as llm.<profile>: inline `siliconflow.api_key` (config.local.yaml)
@@ -62,10 +69,21 @@ siliconflow:
     concurrency: 4            # loader parallelism (smoke test: no 429s at concurrency 4)
     timeout_s: 120
     max_retries: 6
+    backoff_base_s: 1.0
+    backoff_cap_s: 60.0
+    price_per_1m_tokens: 2.0  # only affects load_pg's cost estimate
   rerank:
     model: Qwen/Qwen3-Reranker-8B
     timeout_s: 120
-    max_retries: 1            # query path: fall back to retriever order quickly
+    # 429s from SiliconFlow are per-minute *token* limits ("TPM limit reached"),
+    # so a ~1s retry cannot recover — the window has to roll over. A full
+    # retrieve_k=200 request is ~157KB / ~60k tokens, so bursts hit the ceiling
+    # easily; with max_retries=1 the request silently degraded to retriever
+    # order (26 of 989 requests in the recorded eval run).
+    # Delays: 8s, 16s, 32s, 60s, 60s (~3 min total) — enough for a TPM window.
+    max_retries: 4
+    backoff_base_s: 8.0
+    backoff_cap_s: 60.0
     max_documents_per_request: null   # smoke-tested at 200, no cap hit
     use_instruction: true     # API supports a custom instruction; v2's INSTRUCTION is passed
 

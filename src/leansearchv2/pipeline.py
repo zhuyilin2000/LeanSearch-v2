@@ -152,6 +152,15 @@ class RetrievalPipeline:
             )
             self.reranker_models.append(m)
 
+        if not self.reranker_models:
+            print(
+                "Warning: no reranker replicas loaded "
+                f"(num_gpus={self.num_gpus}; replicas are placed on cuda:1..N-1 and "
+                "GPU 0 hosts the embedding model). Requests with rerank=true will "
+                "return retriever order."
+            )
+            sys.stdout.flush()
+
         print(f"\n{'=' * 60}")
         print(f"All {len(self.reranker_models)} reranker replica(s) ready")
         print(f"{'=' * 60}")
@@ -321,6 +330,16 @@ class RetrievalPipeline:
             return []
 
         n = len(self.reranker_models)
+        if n == 0:
+            # `reranker_devices` is built from `range(1, num_gpus)` because GPU 0
+            # hosts the embedding model, so a single-GPU host loads no replica at
+            # all. Degrade the same way as any other rerank failure instead of
+            # dividing by zero.
+            print(
+                "Warning: no reranker replicas loaded; falling back to retriever order"
+            )
+            return list(fallback_scores)
+
         chunk = (len(pairs) + n - 1) // n
         chunks = [pairs[i : i + chunk] for i in range(0, len(pairs), chunk)]
 

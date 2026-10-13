@@ -59,7 +59,18 @@ async def lifespan(app: FastAPI):
             ),
         )
     log.info("Ready (index_backend=%s)", app.pipeline.index_backend)
-    yield
+    try:
+        yield
+    finally:
+        # Release the connection pool and the two httpx clients on shutdown;
+        # `close()` had no caller at all, so they leaked until process exit.
+        close = getattr(app.pipeline, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception as e:  # shutdown must not raise
+                log.warning("pipeline close failed: %s", e)
+        app.pipeline = None
 
 
 app = FastAPI(lifespan=lifespan)
@@ -68,9 +79,9 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/search")
 def search(
     query: list[str] = Body(...),
-    num_results: int = Body(default=10),
+    num_results: int = Body(default=10, ge=1, le=1000),
     rerank: bool = Body(default=True),
-    retrieve_k: int | None = Body(default=None),
+    retrieve_k: int | None = Body(default=None, ge=1, le=10000),
 ) -> list[list[SearchResult]]:
     t0 = time.time()
     results = [
@@ -86,9 +97,9 @@ def search(
 @app.post("/search_with_profile")
 def search_with_profile(
     query: list[str] = Body(...),
-    num_results: int = Body(default=10),
+    num_results: int = Body(default=10, ge=1, le=1000),
     rerank: bool = Body(default=True),
-    retrieve_k: int | None = Body(default=None),
+    retrieve_k: int | None = Body(default=None, ge=1, le=10000),
 ) -> dict:
     t0 = time.time()
     all_results = []

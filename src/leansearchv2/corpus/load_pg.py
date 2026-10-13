@@ -5,11 +5,12 @@ Subcommands (all idempotent / resumable)::
     python -m leansearchv2.corpus.load_pg init     [--jsonl PATH]
     python -m leansearchv2.corpus.load_pg load     [--jsonl PATH] [--batch-rows 1000]
     python -m leansearchv2.corpus.load_pg status
-    python -m leansearchv2.corpus.load_pg embed    [--batch-size 32] [--concurrency 1]
-                                                   [--min-interval-ms 250]
+    python -m leansearchv2.corpus.load_pg embed    [--batch-size N] [--concurrency N]
+                                                   [--min-interval-ms N]
                                                    [--max-requests N] [--max-tokens N]
                                                    [--price-per-1m-tokens X] [--dry-run]
     python -m leansearchv2.corpus.load_pg index    [--m 16] [--ef-construction 200]
+                                                   [--maintenance-work-mem 8GB]
     python -m leansearchv2.corpus.load_pg verify   [--sample 100] [--self-check 20]
 
 `init` creates database ``leansearch`` (in the container pointed at by
@@ -19,6 +20,11 @@ via the SiliconFlow API with per-batch commits — crash at any point and a
 re-run resumes where it stopped. `index` (optional) builds the HNSW index;
 without it, retrieval does an exact scan. `verify` checks DB↔JSONL parity
 plus an end-to-end self-retrieval sanity test.
+
+Defaults are config-driven: `embed`'s batch size and concurrency come from
+``siliconflow.embedding.*``, `index`'s working memory from
+``pg.maintenance_work_mem`` (see config.yaml). Every one of them is
+overridable by the matching flag or upper-case env var.
 """
 
 from __future__ import annotations
@@ -112,14 +118,6 @@ def _jsonl_rows(path: Path) -> Iterator[tuple[dict[str, Any], str]]:
             line = line.strip()
             if not line:
                 continue
-            try:
-                row = json.loads(
-                    line,
-                    parse_constant=lambda c: (_nan_constant(c), None)[0],
-                )
-            except json.JSONDecodeError as e:
-                raise SystemExit(f"{path}:{lineno}: invalid JSON: {e}")
-
             def _warn(field: str) -> None:
                 print(f"warning: {path}:{lineno}: non-standard {field} literal in JSON, mapped to None", file=sys.stderr)
 
@@ -128,6 +126,15 @@ def _jsonl_rows(path: Path) -> Iterator[tuple[dict[str, Any], str]]:
                     _warn(c)
                     return None
                 raise ValueError(f"unexpected constant {c}")
+
+            # NOTE: both helpers must be bound *before* json.loads runs. The
+            # parse_constant hook is a closure over them, so defining them after
+            # this call makes a NaN literal raise NameError from the hook —
+            # i.e. it fails in exactly the case it exists to handle.
+            try:
+                row = json.loads(line, parse_constant=_nan_constant)
+            except json.JSONDecodeError as e:
+                raise SystemExit(f"{path}:{lineno}: invalid JSON: {e}")
 
             if not isinstance(row, dict) or set(row.keys()) != EXPECTED_FIELDS:
                 raise SystemExit(
@@ -298,6 +305,17 @@ def _embed_worker(
     conn = pgdb.connect()
     stop_reason: str | None = None
     consecutive_failures = 0
+
+    def _drain_tokens() -> int:
+        """Tokens spent since the last drain, resetting the counter.
+
+        Used on the failure path too: a batch can pay for its prompt tokens
+        and then roll back, and a rollback does not refund them.
+        """
+        spent = embedder.total_prompt_tokens
+        embedder.total_prompt_tokens = 0
+        return spent
+
     try:
         while not stop.is_set():
             t0 = time.time()
@@ -305,8 +323,6 @@ def _embed_worker(
                 with conn.transaction():
                     rows = conn.execute(CLAIM_SQL, (batch_size,)).fetchall()
                     if not rows:
-                        with progress_lock:
-                            progress["workers_done"] += 1
                         return
                     embeddings = embedder.embed([r[1] for r in rows])
                     with conn.cursor() as cur:
@@ -323,6 +339,11 @@ def _embed_worker(
                 consecutive_failures = 0
             except Exception as e:  # noqa: BLE001 — one bad batch must not kill the run
                 consecutive_failures += 1
+                # The HTTP call may have succeeded before the DB write failed.
+                # Drain those tokens now, or the next successful batch counts
+                # them again and the reported cost/ETA drift upward.
+                with progress_lock:
+                    progress["tokens"] += _drain_tokens()
                 log.warning(
                     "[worker %d] batch failed (%d/%d consecutive): %s",
                     worker_id, consecutive_failures, MAX_CONSECUTIVE_BATCH_FAILURES, e,
@@ -336,9 +357,8 @@ def _embed_worker(
 
             with progress_lock:
                 progress["done"] += len(rows)
-                progress["tokens"] += embedder.total_prompt_tokens
+                progress["tokens"] += _drain_tokens()  # consume per-batch
                 progress["requests"] += 1
-                embedder.total_prompt_tokens = 0  # consume per-batch
                 done, tokens, requests = progress["done"], progress["tokens"], progress["requests"]
                 if max_requests is not None and requests >= max_requests:
                     stop_reason = f"max-requests={max_requests} reached"
@@ -406,7 +426,7 @@ def cmd_embed(args: argparse.Namespace) -> int:
     stop = threading.Event()
     progress = {
         "total": pending, "done": 0, "tokens": 0, "requests": 0,
-        "workers_done": 0, "elapsed_start": time.time(),
+        "elapsed_start": time.time(),
     }
     progress_lock = threading.Lock()
     threads = [
@@ -451,10 +471,35 @@ def cmd_embed(args: argparse.Namespace) -> int:
 def cmd_index(args: argparse.Namespace) -> int:
     conn = pgdb.connect()
     try:
-        print("building HNSW index (this is optional; exact scan works without it)...")
+        print(
+            "building HNSW index (this is optional; exact scan works without it; "
+            f"maintenance_work_mem = {args.maintenance_work_mem})..."
+        )
         t0 = time.time()
         with conn.transaction():
-            conn.execute("SET maintenance_work_mem = '1GB'")
+            # maintenance_work_mem must be allocated from *private* memory here.
+            # With parallel maintenance workers Postgres carves it out of a
+            # dynamic shared memory segment (dynamic_shared_memory_type=posix ->
+            # /dev/shm), which a stock Docker container caps at 64MB: an 8GB
+            # build then dies with
+            #   DiskFull: could not resize shared memory segment ... No space left
+            # even though the data directory has plenty of room. Serial builds
+            # use the backend's own address space instead, which is what the
+            # measurements in the comment below were taken with.
+            conn.execute(
+                "SELECT set_config('max_parallel_maintenance_workers', %s, false)",
+                (str(args.parallel_maintenance_workers),),
+            )
+            # HNSW builds its graph in memory and spills to disk when this is
+            # too small, which roughly triples build time (measured on this
+            # corpus: 20k x 1024-dim vectors spill below ~96MB, i.e. ~4KB per
+            # row, so the full 310k-row build needs >= ~1.4GB). set_config()
+            # rather than SET so the value is a bound parameter that Postgres
+            # parses and validates — a bad value fails loudly here.
+            conn.execute(
+                "SELECT set_config('maintenance_work_mem', %s, false)",
+                (args.maintenance_work_mem,),
+            )
             conn.execute(
                 f"CREATE INDEX IF NOT EXISTS entries_embedding_hnsw "
                 f"ON entries USING hnsw (embedding vector_cosine_ops) "
@@ -614,16 +659,28 @@ def main() -> int:
     p = sub.add_parser("embed", help="embed pending rows via SiliconFlow API (resumable)")
     p.add_argument("--batch-size", type=int,
                    default=int(get("SILICONFLOW_EMBEDDING_BATCH_SIZE", "siliconflow", "embedding", "batch_size", default=32)))
-    p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--concurrency", type=int,
+                   default=int(get("SILICONFLOW_EMBEDDING_CONCURRENCY", "siliconflow", "embedding", "concurrency", default=1)))
     p.add_argument("--min-interval-ms", type=int, default=250)
     p.add_argument("--max-requests", type=int, default=None)
     p.add_argument("--max-tokens", type=int, default=None)
-    p.add_argument("--price-per-1m-tokens", type=float, default=0.5)
+    p.add_argument("--price-per-1m-tokens", type=float,
+                   default=float(get("SILICONFLOW_EMBEDDING_PRICE_PER_1M_TOKENS",
+                                     "siliconflow", "embedding", "price_per_1m_tokens", default=2.0)),
+                   help="only affects the cost estimate; Qwen3-Embedding-8B list price is ¥2/1M tokens")
     p.add_argument("--dry-run", action="store_true")
 
     p = sub.add_parser("index", help="build optional HNSW index")
     p.add_argument("--m", type=int, default=16)
     p.add_argument("--ef-construction", type=int, default=200)
+    p.add_argument("--maintenance-work-mem", type=str,
+                   default=get("PG_MAINTENANCE_WORK_MEM", "pg", "maintenance_work_mem", default="8GB"),
+                   help="HNSW build memory; ~4KB per row is enough to avoid spilling")
+    p.add_argument("--parallel-maintenance-workers", type=int,
+                   default=int(get("PG_PARALLEL_MAINTENANCE_WORKERS", "pg",
+                                   "parallel_maintenance_workers", default=0)),
+                   help="0 (default) keeps the build serial so maintenance_work_mem comes "
+                        "from private memory; >0 needs a large /dev/shm in the container")
 
     p = sub.add_parser("verify", help="check DB↔JSONL parity + self-retrieval sanity")
     p.add_argument("--jsonl", type=str, default=None)
@@ -633,10 +690,6 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)  # one line per API call is noise
-
-    if args.cmd in ("load", "verify", "init"):
-        # init doesn't read the jsonl but keep the arg accepted for symmetry
-        pass
 
     return {
         "init": cmd_init,

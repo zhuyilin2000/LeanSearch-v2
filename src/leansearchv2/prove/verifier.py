@@ -28,6 +28,38 @@ class VerifyResult:
         return self.complete and not self.has_sorry
 
 
+def _as_lean_error(response: object) -> str | None:
+    """Return a message when `response` is *not* a successful `CommandResponse`.
+
+    `LeanServer.run()` is typed `CommandResponse | LeanError`, and `LeanError`
+    carries a single `message` field. Reading messages with
+    `getattr(response, "messages", [])` therefore yields an empty list for a
+    `LeanError`, which used to be reported as a *successful* verification: no
+    errors, no `sorry`, so `complete=True`.
+
+    That is reachable in practice. The REPL turns any exception escaping
+    `IO.processInput` (missing module, failed `.olean` load, heartbeat
+    interruption, stack overflow) into `{"message": ...}`, which
+    `lean-interact` maps to `LeanError` rather than to messages with
+    `severity="error"`. Fail closed instead of assuming success.
+    """
+    try:
+        from lean_interact import LeanError
+    except ImportError:  # pragma: no cover - lean extra not installed
+        LeanError = None
+
+    if LeanError is not None and isinstance(response, LeanError):
+        message = getattr(response, "message", "") or ""
+        return message.strip() or "Lean REPL returned an error with no message"
+
+    if not hasattr(response, "messages"):
+        return (
+            "Lean REPL returned an unexpected response of type "
+            f"{type(response).__name__} (no `messages` field); treating as failure"
+        )
+    return None
+
+
 class Verifier:
     async def verify(self, code: str, timeout_s: int = 600) -> VerifyResult:  # pragma: no cover
         raise NotImplementedError
@@ -85,6 +117,17 @@ class LeanInteractVerifier(Verifier):
             response = await asyncio.to_thread(
                 self._server.run, Command(cmd=code), timeout=timeout_s
             )
+        # Fail closed: a LeanError (or any unexpected response) must never be
+        # mistaken for a clean compile just because it lacks a `messages` list.
+        lean_error = _as_lean_error(response)
+        if lean_error is not None:
+            return VerifyResult(
+                complete=False,
+                error_msg=f"Lean REPL did not produce a command response: {lean_error}",
+                has_sorry=False,
+                raw=getattr(response, "model_dump", lambda: None)(),
+            )
+
         messages = getattr(response, "messages", []) or []
         sorries = getattr(response, "sorries", []) or []
         errors = [m for m in messages if getattr(m, "severity", "") == "error"]
@@ -95,8 +138,10 @@ class LeanInteractVerifier(Verifier):
             return VerifyResult(complete=True, error_msg="", has_sorry=False, raw=getattr(response, "model_dump", lambda: None)())
         err_parts: list[str] = []
         for m in errors:
-            pos = getattr(m, "pos", None)
-            line = f"line {pos.line}" if pos and hasattr(pos, "line") else ""
+            # lean-interact exposes the position as `start_pos` (the wire field
+            # is aliased to `pos`, which is only used for deserialisation).
+            pos = getattr(m, "start_pos", None) or getattr(m, "pos", None)
+            line = f"line {pos.line}" if pos is not None and hasattr(pos, "line") else ""
             err_parts.append(f"[{line}] {getattr(m, 'data', '')}".strip())
         if has_sorry and not errors:
             err_parts.append("Proof still contains `sorry`.")

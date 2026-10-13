@@ -17,6 +17,29 @@ from ..llm import LLMClient
 from . import prompts
 
 
+def _string_list(value: Any) -> list[str]:
+    """Coerce a JSON field into a list of non-empty query strings.
+
+    Models occasionally answer with a bare string where an array was requested.
+    ``list("The definition of a UFD")`` would silently explode into 21
+    one-character queries, each costing a retrieval plus a filter LLM call.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value.strip()] if value.strip() else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [s.strip() for s in value if isinstance(s, str) and s.strip()]
+
+
+def _step_list(value: Any) -> list[dict[str, Any]]:
+    """Keep only the dict-shaped entries of a ``steps`` field."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [s for s in value if isinstance(s, dict)]
+
+
 @dataclass
 class ProofPlan:
     definition_queries: list[str] = field(default_factory=list)
@@ -28,8 +51,7 @@ class ProofPlan:
     def step_queries(self) -> list[str]:
         out: list[str] = []
         for s in self.steps:
-            for q in s.get("queries", []) or []:
-                out.append(q)
+            out.extend(_string_list(s.get("queries")))
         return out
 
     @property
@@ -44,16 +66,23 @@ class ProofPlan:
 
 
 def _parse_json(response: str) -> dict[str, Any]:
-    """Extract the first JSON object from `response`. Accepts plain JSON or
-    fenced ```json blocks. Raises on parse failure (caller retries upstream)."""
+    """Extract the first JSON *object* from `response`. Accepts plain JSON or
+    fenced ```json blocks. Raises on parse failure (caller retries upstream).
+
+    Every candidate is checked with `isinstance(obj, dict)`: a response whose
+    fenced block holds a bare array/scalar is valid JSON, and returning it would
+    hand a list to callers that immediately call `.get()`.
+    """
     text = response or ""
     fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
     candidates = fenced + [text]
     for cand in candidates:
         try:
-            return json.loads(cand.strip())
+            obj = json.loads(cand.strip())
         except json.JSONDecodeError:
             continue
+        if isinstance(obj, dict):
+            return obj
     decoder = json.JSONDecoder()
     for i, ch in enumerate(text):
         if ch == "{":
@@ -99,8 +128,8 @@ async def decompose(
     )
     data = _parse_json(response)
     return ProofPlan(
-        definition_queries=list(data.get("definition_queries") or []),
-        highlevel_queries=list(data.get("highlevel_queries") or []),
-        steps=list(data.get("steps") or []),
+        definition_queries=_string_list(data.get("definition_queries")),
+        highlevel_queries=_string_list(data.get("highlevel_queries")),
+        steps=_step_list(data.get("steps")),
         raw_response=response,
     )

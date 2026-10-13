@@ -31,7 +31,7 @@ from typing import Any
 from psycopg_pool import ConnectionPool
 
 from . import pgdb
-from .config import get
+from .config import get, get_bool
 from .siliconflow import (
     SiliconFlowEmbedder,
     SiliconFlowError,
@@ -98,12 +98,20 @@ class PGRetrievalPipeline:
             embedder=embedder_from_config(),
             reranker=reranker_from_config(),
             ef_search=int(get("PG_EF_SEARCH", "pg", "ef_search", default=512)),
-            exact_scan=bool(get("PG_EXACT_SCAN", "pg", "exact_scan", default=False)),
+            exact_scan=get_bool("PG_EXACT_SCAN", "pg", "exact_scan", default=False),
         )
 
-    def _configure_conn(self, conn) -> None:
+    def _configure_conn(self, conn, k: int | None = None) -> None:
         # hnsw.ef_search only matters once a HNSW index exists; harmless otherwise.
-        conn.execute(f"SET hnsw.ef_search = {int(self.ef_search)}")
+        # It must be >= the LIMIT: below it pgvector returns *fewer rows than
+        # requested* rather than merely ranking them worse (measured: ef_search=40
+        # with LIMIT 200 yields 40 rows, and the rerank stage then scores a
+        # truncated candidate set). Raising it to cover k keeps the candidate
+        # count exact regardless of how `pg.ef_search` is configured.
+        ef = int(self.ef_search)
+        if k is not None:
+            ef = max(ef, int(k))
+        conn.execute(f"SET hnsw.ef_search = {ef}")
 
     def _retrieve(self, emb: list[float], k: int) -> list[dict[str, Any]]:
         """Top-k rows by cosine distance. Without a HNSW index this is an
@@ -113,7 +121,7 @@ class PGRetrievalPipeline:
 
         vec = Vector(emb)  # plain list[float] would adapt to double precision[]
         with self._pool.connection() as conn:
-            self._configure_conn(conn)
+            self._configure_conn(conn, k)
             if self.exact_scan:
                 with conn.transaction():
                     conn.execute("SET LOCAL enable_indexscan = off")
@@ -189,7 +197,6 @@ class PGRetrievalPipeline:
                 return results, profile
             return results
 
-        dist_map = {r["id"]: d for r, d in candidates}
         candidate_rows = [r for r, _ in candidates]
         n = len(candidate_rows)
         retriever_rank_scores = [(n - i) / n for i in range(n)]
