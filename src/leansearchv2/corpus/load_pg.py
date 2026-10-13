@@ -559,7 +559,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
                     if checked >= args.self_check:
                         break
                     row = conn.execute(
-                        "SELECT index, text_to_embed FROM entries "
+                        "SELECT id, text_to_embed FROM entries "
                         "WHERE array_to_string(name, '.') = %s LIMIT 1", (fn,)
                     ).fetchone()
                     if row is None:
